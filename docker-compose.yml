@@ -1,0 +1,163 @@
+version: "3.9"
+
+# Shared peer list — every node gets the same PEERS env var so they know
+# how to reach each other over the Docker internal network.
+x-peers: &peers
+  PEERS: >-
+    node01=node01:8080,
+    node02=node02:8080,
+    node03=node03:8080,
+    node04=node04:8080,
+    node05=node05:8080,
+    node06=node06:8080,
+    node07=node07:8080,
+    node08=node08:8080,
+    node09=node09:8080,
+    node10=node10:8080
+
+x-common: &common
+  build: .
+  volumes:
+    - ./topology/topology.json:/etc/gossip/topology.json:ro
+  environment:
+    <<: *peers
+    TOPOLOGY_FILE: /etc/gossip/topology.json
+    TOTAL_SHARES: "10"
+  networks:
+    - gossip-net
+  restart: unless-stopped
+
+services:
+  node01:
+    <<: *common
+    container_name: node01
+    hostname: node01
+    environment:
+      <<: *peers
+      NODE_ID: node01
+      PORT: "8080"
+      TOPOLOGY_FILE: /etc/gossip/topology.json
+      TOTAL_SHARES: "10"
+    ports:
+      - "8081:8080"
+
+  node02:
+    <<: *common
+    container_name: node02
+    hostname: node02
+    environment:
+      <<: *peers
+      NODE_ID: node02
+      PORT: "8080"
+      TOPOLOGY_FILE: /etc/gossip/topology.json
+      TOTAL_SHARES: "10"
+    ports:
+      - "8082:8080"
+
+  node03:
+    <<: *common
+    container_name: node03
+    hostname: node03
+    environment:
+      <<: *peers
+      NODE_ID: node03
+      PORT: "8080"
+      TOPOLOGY_FILE: /etc/gossip/topology.json
+      TOTAL_SHARES: "10"
+    ports:
+      - "8083:8080"
+
+  node04:
+    <<: *common
+    container_name: node04
+    hostname: node04
+    environment:
+      <<: *peers
+      NODE_ID: node04
+      PORT: "8080"
+      TOPOLOGY_FILE: /etc/gossip/topology.json
+      TOTAL_SHARES: "10"
+    ports:
+      - "8084:8080"
+
+  node05:
+    <<: *common
+    container_name: node05
+    hostname: node05
+    environment:
+      <<: *peers
+      NODE_ID: node05
+      PORT: "8080"
+      TOPOLOGY_FILE: /etc/gossip/topology.json
+      TOTAL_SHARES: "10"
+    ports:
+      - "8085:8080"
+
+  node06:
+    <<: *common
+    container_name: node06
+    hostname: node06
+    environment:
+      <<: *peers
+      NODE_ID: node06
+      PORT: "8080"
+      TOPOLOGY_FILE: /etc/gossip/topology.json
+      TOTAL_SHARES: "10"
+    ports:
+      - "8086:8080"
+
+  node07:
+    <<: *common
+    container_name: node07
+    hostname: node07
+    environment:
+      <<: *peers
+      NODE_ID: node07
+      PORT: "8080"
+      TOPOLOGY_FILE: /etc/gossip/topology.json
+      TOTAL_SHARES: "10"
+    ports:
+      - "8087:8080"
+
+  node08:
+    <<: *common
+    container_name: node08
+    hostname: node08
+    environment:
+      <<: *peers
+      NODE_ID: node08
+      PORT: "8080"
+      TOPOLOGY_FILE: /etc/gossip/topology.json
+      TOTAL_SHARES: "10"
+    ports:
+      - "8088:8080"
+
+  node09:
+    <<: *common
+    container_name: node09
+    hostname: node09
+    environment:
+      <<: *peers
+      NODE_ID: node09
+      PORT: "8080"
+      TOPOLOGY_FILE: /etc/gossip/topology.json
+      TOTAL_SHARES: "10"
+    ports:
+      - "8089:8080"
+
+  node10:
+    <<: *common
+    container_name: node10
+    hostname: node10
+    environment:
+      <<: *peers
+      NODE_ID: node10
+      PORT: "8080"
+      TOPOLOGY_FILE: /etc/gossip/topology.json
+      TOTAL_SHARES: "10"
+    ports:
+      - "8090:8080"
+
+networks:
+  gossip-net:
+    driver: bridge

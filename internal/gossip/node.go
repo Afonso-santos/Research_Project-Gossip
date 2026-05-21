@@ -2,12 +2,14 @@ package gossip
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math"
-	"math/rand"
+	mathrand "math/rand"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -17,36 +19,37 @@ import (
 const (
 	HardcodedCID      = "QmYourCIDHere"
 	HardcodedSecretID = "my-secret-001"
-	// τarp: target application-level reception probability
-	TauARP = 0.99
+	TauARP            = 0.99
 )
 
 // HopEvent records a localized gossip jump.
 type HopEvent struct {
-	Hop       int    `json:"hop"`
-	FromNode  string `json:"from_node"`
-	SecretID  string `json:"secret_id"`
-	Timestamp int64  `json:"timestamp_ms"`
+	Hop        int    `json:"hop"`
+	FromNode   string `json:"from_node"`
+	SecretID   string `json:"secret_id"`
+	FragmentID int    `json:"fragment_id"`
+	Timestamp  int64  `json:"timestamp_ms"`
 }
 
-// Message is the gossip envelope passed between nodes.
 type Message struct {
-	CID       string `json:"cid"`
-	SecretID  string `json:"secret_id"`
-	Target    string `json:"target"`
-	Sender    string `json:"sender"`
-	HopCount  int    `json:"hop_count"`
-	Timestamp int64  `json:"timestamp"`
+	CID          string `json:"cid"`
+	SecretID     string `json:"secret_id"`
+	Target       string `json:"target"`
+	Sender       string `json:"sender"`
+	HopCount     int    `json:"hop_count"`
+	Timestamp    int64  `json:"timestamp"`
+	FragmentID   int    `json:"fragment_id"`
+	Data         []byte `json:"data"`
+	IsRevocation bool   `json:"is_revocation"` // <-- NEW: Flags this as an Anti-Rumor
 }
 
-// ShareRecord represents a reconstructed share at a node.
 type ShareRecord struct {
-	SecretID string `json:"secret_id"`
-	CID      string `json:"cid"`
-	Received int64  `json:"received_at"`
+	SecretID  string         `json:"secret_id"`
+	CID       string         `json:"cid"`
+	Received  int64          `json:"received_at"`
+	Fragments map[int][]byte `json:"-"`
 }
 
-// Status is the JSON response for /status.
 type Status struct {
 	Node           string                 `json:"node"`
 	Topology       string                 `json:"topology"`
@@ -59,7 +62,6 @@ type Status struct {
 	HopLog         []HopEvent             `json:"hop_log"`
 }
 
-// Node represents a single gossip node.
 type Node struct {
 	mu sync.RWMutex
 
@@ -68,21 +70,18 @@ type Node struct {
 	Target      string
 	Diameter    int
 	Neighbors   []string
-	TwoHopTable map[string][]string // neighbor -> their neighbors
-	PeerPorts   map[string]string   // nodeID -> "host:port"
+	TwoHopTable map[string][]string
+	PeerPorts   map[string]string
 
-	// State
 	Reconstructed  map[string]ShareRecord
 	SharesBuffered map[string]int
 	Tombstones     map[string]bool
 	TotalShares    int
 	HopLog         []HopEvent
 
-	// Channel for incoming messages
 	incoming chan Message
 }
 
-// NewNode creates a Node from config.
 func NewNode(id string, topo *config.Topology, peerPorts map[string]string, totalShares int) *Node {
 	nodeCfg := topo.Nodes[id]
 	twoHop := topo.TwoHopNeighbors(id)
@@ -106,106 +105,255 @@ func NewNode(id string, topo *config.Topology, peerPorts map[string]string, tota
 	return n
 }
 
-// Inject starts gossip from this node (called on node01).
+// Inject starts gossip from this node.
 func (n *Node) Inject(secretID, cid string) {
 	n.mu.Lock()
+
+	frag0 := make([]byte, len(cid))
+	rand.Read(frag0)
+
+	frag1 := make([]byte, len(cid))
+	for i := 0; i < len(cid); i++ {
+		frag1[i] = cid[i] ^ frag0[i]
+	}
+
 	n.Reconstructed[secretID] = ShareRecord{
 		SecretID: secretID,
 		CID:      cid,
 		Received: time.Now().UnixMilli(),
+		Fragments: map[int][]byte{
+			0: frag0,
+			1: frag1,
+		},
 	}
-	n.SharesBuffered[secretID] = n.TotalShares
-	
-	// Record the injection as Hop 0
+
 	n.HopLog = append(n.HopLog, HopEvent{
-		Hop:       0,
-		FromNode:  "init",
-		SecretID:  secretID,
-		Timestamp: time.Now().UnixMilli(),
+		Hop:        0,
+		FromNode:   "init",
+		SecretID:   secretID,
+		FragmentID: 0,
+		Timestamp:  time.Now().UnixMilli(),
+	})
+	n.HopLog = append(n.HopLog, HopEvent{
+		Hop:        0,
+		FromNode:   "init",
+		SecretID:   secretID,
+		FragmentID: 1,
+		Timestamp:  time.Now().UnixMilli(),
 	})
 	n.mu.Unlock()
 
-	msg := Message{
-		CID:       cid,
-		SecretID:  secretID,
-		Target:    n.Target,
-		Sender:    n.ID,
-		HopCount:  0,
-		Timestamp: time.Now().UnixMilli(),
+	half := len(n.Neighbors) / 2
+	if half == 0 {
+		half = 1
 	}
-	n.gossipOut(msg)
+
+	group0 := n.Neighbors[:half]
+	group1 := n.Neighbors[half:]
+
+	msg0 := Message{
+		SecretID:   secretID,
+		Target:     n.Target,
+		Sender:     n.ID,
+		HopCount:   1,
+		Timestamp:  time.Now().UnixMilli(),
+		FragmentID: 0,
+		Data:       frag0,
+	}
+	n.gossipOutTo(msg0, group0)
+
+	msg1 := Message{
+		SecretID:   secretID,
+		Target:     n.Target,
+		Sender:     n.ID,
+		HopCount:   1,
+		Timestamp:  time.Now().UnixMilli(),
+		FragmentID: 1,
+		Data:       frag1,
+	}
+	n.gossipOutTo(msg1, group1)
 }
 
-// Receive enqueues an incoming message.
+// NEW: Revoke acts as an Anti-Rumor to hunt down and kill a secret
+func (n *Node) Revoke(secretID string) {
+	n.mu.Lock()
+	
+	// Find the current max hop so the Anti-Rumor aligns chronologically in the bash logs
+	maxHop := 0
+	for _, ev := range n.HopLog {
+		if ev.SecretID == secretID && ev.Hop > maxHop {
+			maxHop = ev.Hop
+		}
+	}
+	startRevokeHop := maxHop + 1
+
+	// 1. Instantly delete any fragments we hold locally
+	delete(n.Reconstructed, secretID)
+	n.SharesBuffered[secretID] = 0
+
+	// 2. Permanently tombstone it so we never accept it again
+	n.Tombstones[secretID] = true
+
+	// 3. Log the start of the Anti-Rumor in the HopLog so the script sees it
+	n.HopLog = append(n.HopLog, HopEvent{
+		Hop:        startRevokeHop,
+		FromNode:   "init_rev",
+		SecretID:   secretID,
+		FragmentID: -99, // -99 is our special marker for "Revocation"
+		Timestamp:  time.Now().UnixMilli(),
+	})
+	n.mu.Unlock()
+
+	// 4. Create the Anti-Rumor message
+	revokeMsg := Message{
+		SecretID:     secretID,
+		Target:       n.Target,
+		Sender:       n.ID,
+		HopCount:     startRevokeHop + 1,
+		Timestamp:    time.Now().UnixMilli(),
+		FragmentID:   -99,
+		IsRevocation: true, 
+	}
+
+	// 5. Shout it to ALL neighbors (Bypassing disjoint filters)
+	n.gossipOutTo(revokeMsg, n.Neighbors)
+}
+
 func (n *Node) Receive(msg Message) {
 	n.incoming <- msg
 }
 
-// processLoop handles incoming messages with goroutines/channels.
 func (n *Node) processLoop() {
 	for msg := range n.incoming {
 		n.handleMessage(msg)
 	}
 }
-
-// handleMessage implements the AAG 2-hop neighborhood algorithm.
 func (n *Node) handleMessage(msg Message) {
 	n.mu.Lock()
 
-	// Deduplicate: already have it?
-	if _, seen := n.Reconstructed[msg.SecretID]; seen {
+	// ====================================================================
+	// REVOCATION INTERCEPTOR (Anti-Rumor handling)
+	// ====================================================================
+	if msg.IsRevocation {
+		// If already tombstoned, ignore to prevent infinite anti-rumor loops
+		if n.Tombstones[msg.SecretID] {
+			n.mu.Unlock()
+			return
+		}
+
+		log.Printf("[%s] 🚨 REVOCATION RECEIVED for %s. Purging fragments!", n.ID, msg.SecretID)
+
+		delete(n.Reconstructed, msg.SecretID)
+		n.SharesBuffered[msg.SecretID] = 0
+		n.Tombstones[msg.SecretID] = true
+
+		// LOG THE ANTI-RUMOR HOP SO THE SCRIPT CAN SEE IT!
+		n.HopLog = append(n.HopLog, HopEvent{
+			Hop:        msg.HopCount,
+			FromNode:   msg.Sender,
+			SecretID:   msg.SecretID,
+			FragmentID: -99,
+			Timestamp:  time.Now().UnixMilli(),
+		})
 		n.mu.Unlock()
+
+		// Forward the Anti-Rumor aggressively to all neighbors
+		fwdMsg := msg
+		fwdMsg.Sender = n.ID
+		fwdMsg.HopCount = msg.HopCount + 1
+		
+		// Fast lane for Anti-Rumors (10ms instead of 200ms)
+		go func() {
+			time.Sleep(10 * time.Millisecond) 
+			n.gossipOutTo(fwdMsg, n.Neighbors)
+		}()
 		return
 	}
+
+	// Standard Fragment processing continues here...
 	if n.Tombstones[msg.SecretID] {
 		n.mu.Unlock()
 		return
 	}
 
-	// Record receipt
-	n.Reconstructed[msg.SecretID] = ShareRecord{
-		SecretID: msg.SecretID,
-		CID:      msg.CID,
-		Received: time.Now().UnixMilli(),
+	record, exists := n.Reconstructed[msg.SecretID]
+	if !exists {
+		record = ShareRecord{
+			SecretID:  msg.SecretID,
+			Received:  time.Now().UnixMilli(),
+			Fragments: make(map[int][]byte),
+		}
+	} else if record.Fragments == nil {
+		record.Fragments = make(map[int][]byte)
 	}
-	n.SharesBuffered[msg.SecretID] = n.TotalShares
 
-	// Record the event hop log
-	n.HopLog = append(n.HopLog, HopEvent{
-		Hop:       msg.HopCount,
-		FromNode:  msg.Sender,
-		SecretID:  msg.SecretID,
-		Timestamp: time.Now().UnixMilli(),
-	})
-
-	isTarget := n.ID == msg.Target
-	if isTarget {
-		// Target node: tombstone, stop forwarding
-		n.Tombstones[msg.SecretID] = true
-		log.Printf("[%s] 🎯 TARGET REACHED — tombstoning %s", n.ID, msg.SecretID)
+	if _, seenFrag := record.Fragments[msg.FragmentID]; seenFrag {
 		n.mu.Unlock()
 		return
 	}
 
-	// Build forwarding message
-	fwdMsg := Message{
-		CID:       msg.CID,
-		SecretID:  msg.SecretID,
-		Target:    msg.Target,
-		Sender:    n.ID,
-		HopCount:  msg.HopCount + 1,
-		Timestamp: time.Now().UnixMilli(),
+	record.Fragments[msg.FragmentID] = msg.Data
+	isTarget := n.ID == msg.Target
+
+	if len(record.Fragments) == 2 && record.CID == "" {
+		f0 := record.Fragments[0]
+		f1 := record.Fragments[1]
+		recovered := make([]byte, len(f0))
+		for i := 0; i < len(f0); i++ {
+			recovered[i] = f0[i] ^ f1[i]
+		}
+		record.CID = string(recovered)
+
+		if isTarget {
+			n.Tombstones[msg.SecretID] = true
+			log.Printf("[%s] 🎯 TARGET REACHED — Reconstructed CID: %s, tombstoning %s", n.ID, record.CID, msg.SecretID)
+		}
 	}
 
-	// AAG: compute which neighbors DIDN'T receive from sender
-	// Mr = neighbors of sender (nodes that received msg from sender)
-	senderNeighbors := n.twoHopNeighborsOf(msg.Sender)
-	mr := toSet(senderNeighbors)
-	mr[msg.Sender] = true // sender itself
+	n.Reconstructed[msg.SecretID] = record
+
+	n.HopLog = append(n.HopLog, HopEvent{
+		Hop:        msg.HopCount,
+		FromNode:   msg.Sender,
+		SecretID:   msg.SecretID,
+		FragmentID: msg.FragmentID,
+		Timestamp:  time.Now().UnixMilli(),
+	})
+
+	if isTarget {
+		n.mu.Unlock()
+		return
+	}
+
+	fwdMsg := Message{
+		SecretID:   msg.SecretID,
+		Target:     msg.Target,
+		Sender:     n.ID,
+		HopCount:   msg.HopCount + 1,
+		Timestamp:  time.Now().UnixMilli(),
+		FragmentID: msg.FragmentID,
+		Data:       msg.Data,
+	}
 
 	n.mu.Unlock()
 
-	// Determine child nodes (my neighbors NOT in Mr)
+	go n.delayedAAGForward(fwdMsg)
+}
+func (n *Node) delayedAAGForward(fwdMsg Message) {
+	time.Sleep(200 * time.Millisecond)
+
+	n.mu.Lock()
+	mr := make(map[string]bool)
+	for _, event := range n.HopLog {
+		if event.SecretID == fwdMsg.SecretID && event.FromNode != "init" {
+			mr[event.FromNode] = true
+			for _, nb := range n.twoHopNeighborsOf(event.FromNode) {
+				mr[nb] = true
+			}
+		}
+	}
+	n.mu.Unlock()
+
 	var children []string
 	for _, nb := range n.Neighbors {
 		if !mr[nb] {
@@ -213,18 +361,43 @@ func (n *Node) handleMessage(msg Message) {
 		}
 	}
 
-	if len(children) == 0 {
-		// No children that need this — still forward with base probability
-		p := n.baseProbability()
-		if rand.Float64() < p {
-			n.gossipOut(fwdMsg)
+	// ====================================================================
+	// CONFIDENTIALITY UPGRADE: Disjoint Path Filter
+	// ====================================================================
+	if len(children) > 1 {
+		sort.Strings(children) // Ensure deterministic order across all nodes
+		var disjointChildren []string
+		for i, child := range children {
+			// VIP PASS 1: NEVER filter out the final destination!
+			if child == fwdMsg.Target {
+				disjointChildren = append(disjointChildren, child)
+				continue
+			}
+			
+			// Enforce lanes for all other intermediate nodes
+			if i%2 == fwdMsg.FragmentID%2 {
+				disjointChildren = append(disjointChildren, child)
+			}
 		}
+		// Only apply the filter if it doesn't completely dead-end the fragment
+		if len(disjointChildren) > 0 {
+			children = disjointChildren
+		}
+	}
+
+	if len(children) == 0 {
 		return
 	}
 
-	// For each child, compute parent count (nodes in Mr that are also neighbors of child)
 	maxProb := 0.0
 	for _, child := range children {
+		// VIP PASS 2: If the destination is our direct neighbor,
+		// guarantee delivery! Do not rely on probability.
+		if child == fwdMsg.Target {
+			maxProb = 1.0
+			break
+		}
+
 		childNeighbors := n.twoHopNeighborsOf(child)
 		parentCount := 0
 		for _, cn := range childNeighbors {
@@ -241,13 +414,10 @@ func (n *Node) handleMessage(msg Message) {
 		}
 	}
 
-	// Forward with max probability
-	if rand.Float64() < maxProb {
-		n.gossipOut(fwdMsg)
+	if mathrand.Float64() < maxProb {
+		n.gossipOutTo(fwdMsg, children)
 	}
 }
-
-// aagProbability computes p_forward per the AAG formula.
 func (n *Node) aagProbability(parentCount int) float64 {
 	if parentCount <= 1 {
 		return 1.0
@@ -256,9 +426,7 @@ func (n *Node) aagProbability(parentCount int) float64 {
 	if delta < 1 {
 		delta = 1
 	}
-	// τrel: per-hop reliability s.t. τrel^δ = τarp
 	tauRel := math.Pow(TauARP, 1.0/delta)
-	// p_forward s.t. (1-p)^K = (1-τrel)
 	p := 1.0 - math.Pow(1.0-tauRel, 1.0/float64(parentCount))
 	if p > 1.0 {
 		return 1.0
@@ -270,9 +438,8 @@ func (n *Node) baseProbability() float64 {
 	return n.aagProbability(len(n.Neighbors))
 }
 
-// gossipOut sends message to all 1-hop neighbors concurrently.
-func (n *Node) gossipOut(msg Message) {
-	for _, nb := range n.Neighbors {
+func (n *Node) gossipOutTo(msg Message, peers []string) {
+	for _, nb := range peers {
 		go func(peer string) {
 			addr, ok := n.PeerPorts[peer]
 			if !ok {
@@ -290,7 +457,6 @@ func (n *Node) gossipOut(msg Message) {
 	}
 }
 
-// twoHopNeighborsOf returns the known neighbors of a given node from the 2-hop table.
 func (n *Node) twoHopNeighborsOf(nodeID string) []string {
 	if nodeID == n.ID {
 		return n.Neighbors
@@ -298,7 +464,6 @@ func (n *Node) twoHopNeighborsOf(nodeID string) []string {
 	return n.TwoHopTable[nodeID]
 }
 
-// GetStatus returns a snapshot of current node state.
 func (n *Node) GetStatus() Status {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
@@ -309,11 +474,11 @@ func (n *Node) GetStatus() Status {
 	}
 
 	shareCount := 0
-	if _, ok := n.Reconstructed[HardcodedSecretID]; ok {
-		shareCount = n.TotalShares
+	for _, rec := range n.Reconstructed {
+		shareCount = len(rec.Fragments)
+		break 
 	}
 
-	// Deep copy maps & slices
 	rec := make(map[string]ShareRecord, len(n.Reconstructed))
 	for k, v := range n.Reconstructed {
 		rec[k] = v
@@ -339,12 +504,11 @@ func (n *Node) GetStatus() Status {
 		Tombstones:     tombList,
 		TwoHop:         twoHop,
 		ShareCount:     shareCount,
-		TotalShares:    n.TotalShares,
+		TotalShares:    2, 
 		HopLog:         hopLog,
 	}
 }
 
-// helpers
 func toSet(s []string) map[string]bool {
 	m := make(map[string]bool, len(s))
 	for _, v := range s {

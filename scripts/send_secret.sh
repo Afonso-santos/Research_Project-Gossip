@@ -1,39 +1,57 @@
 #!/usr/bin/env bash
 # ============================================================
-#  send_secret.sh — Inject a secret into node01 and parse
-#  the localized HopLogs to track propagation rounds.
-#
-#  Usage:  ./scripts/send_secret.sh [CID] [SECRET_ID]
-#  Example: ./scripts/send_secret.sh QmYourCIDHere my-secret-001
+#  send_secret.sh — Upload a file to IPFS, get the real CID,
+#  and inject it into the Gossip cluster dynamically.
 # ============================================================
 
 set -euo pipefail
 
-# ── Hardcoded defaults (match the Go constants) ──────────────────
-DEFAULT_CID="QmYourCIDHere"
-DEFAULT_SECRET="my-secret-001"
+FILE_PATH="${1:-}"
+TOPO_FILE="${2:-topology/topology.json}"
 
-CID="${1:-$DEFAULT_CID}"
-SECRET_ID="${2:-$DEFAULT_SECRET}"
+if [[ -z "$FILE_PATH" || ! -f "$FILE_PATH" ]]; then
+  echo "❌ ERROR: Please provide a valid file to upload!"
+  echo "Usage: ./scripts/send_secret.sh <path_to_file> [topology_file]"
+  exit 1
+fi
 
-# ── Node port map (host:port for each node) ──────────────────────
-declare -A NODE_PORTS=(
-  [node01]="localhost:8081"
-  [node02]="localhost:8082"
-  [node03]="localhost:8083"
-  [node04]="localhost:8084"
-  [node05]="localhost:8085"
-  [node06]="localhost:8086"
-  [node07]="localhost:8087"
-  [node08]="localhost:8088"
-  [node09]="localhost:8089"
-  [node10]="localhost:8090"
-)
+if [[ ! -f "$TOPO_FILE" ]]; then
+  echo "❌ ERROR: $TOPO_FILE not found!"
+  exit 1
+fi
 
-NODES=(node01 node02 node03 node04 node05 node06 node07 node08 node09 node10)
+# ========================================================
+# 📦 1. UPLOAD FILE TO IPFS
+# ========================================================
+echo "➜ Uploading '$FILE_PATH' to IPFS..."
+# Call the IPFS Kubo API running inside Docker on port 5001
+IPFS_RESP=$(curl -s -X POST -F file=@"$FILE_PATH" "http://localhost:5001/api/v0/add")
+CID=$(echo "$IPFS_RESP" | jq -r '.Hash')
+SECRET_ID=$(basename "$FILE_PATH") # Use the file name as the secret ID
+
+if [[ -z "$CID" || "$CID" == "null" ]]; then
+    echo "❌ ERROR: Failed to upload to IPFS. Did you add the IPFS node to docker-compose.yml?"
+    exit 1
+fi
+
+# ========================================================
+# 🗺️ 2. DYNAMIC TOPOLOGY PARSING
+# ========================================================
+TARGET_NODE=$(jq -r '.target' "$TOPO_FILE")
+ENTRY_NODE=$(jq -r '.nodes | keys | sort | .[0]' "$TOPO_FILE")
+
+declare -A NODE_PORTS
+NODES=()
+PORT_COUNTER=8081
+for node in $(jq -r '.nodes | keys | sort | .[]' "$TOPO_FILE"); do
+    NODES+=("$node")
+    NODE_PORTS["$node"]="localhost:$PORT_COUNTER"
+    PORT_COUNTER=$((PORT_COUNTER + 1))
+done
+total_nodes=${#NODES[@]}
+
 POLL_DURATION=10
 
-# ── Colors & formatting ──────────────────────────────────────────
 BOLD="\033[1m"
 CYAN="\033[36m"
 GREEN="\033[32m"
@@ -41,95 +59,31 @@ YELLOW="\033[33m"
 DIM="\033[2m"
 RESET="\033[0m"
 
-check_deps() {
-  for cmd in curl jq; do
-    if ! command -v "$cmd" &>/dev/null; then
-      echo "ERROR: '$cmd' is required but not installed." >&2
-      exit 1
-    fi
-  done
-}
+get_status() { curl -sf --max-time 2 "http://${NODE_PORTS[$1]}/status" 2>/dev/null || echo '{}'; }
+get_share_info() { echo "$(echo "$1" | jq -r '.share_count // 0') 2"; }
 
-wait_for_cluster() {
-  echo -e "${DIM}Waiting for cluster to be ready...${RESET}"
-  local attempts=0
-  while true; do
-    if curl -sf "http://${NODE_PORTS[node01]}/status" &>/dev/null; then
-      break
-    fi
-    attempts=$((attempts + 1))
-    if [[ $attempts -ge 30 ]]; then
-      echo "ERROR: node01 not reachable after 30s. Is the cluster running?" >&2
-      echo "  Run: docker compose up -d" >&2
-      exit 1
-    fi
-    sleep 1
-    printf "."
-  done
-  echo ""
-}
+echo -e "\n${BOLD}================================================${RESET}"
+echo -e "${BOLD}${CYAN} Gossip Cluster — IPFS Secret Injection${RESET}"
+echo -e "${DIM} Entry Node: ${ENTRY_NODE} | Target: ${TARGET_NODE} | Total: ${total_nodes}${RESET}"
+echo -e "${BOLD} File Name: ${SECRET_ID}${RESET}"
+echo -e "${BOLD} Real CID:  ${GREEN}${CID}${RESET}"
+echo -e "${BOLD}================================================${RESET}\n"
 
-get_status() {
-  local node="$1"
-  local addr="${NODE_PORTS[$node]}"
-  curl -sf --max-time 2 "http://${addr}/status" 2>/dev/null || echo '{}'
-}
+echo -e "${DIM}Waiting for cluster to be ready...${RESET}"
+while ! curl -sf "http://${NODE_PORTS[$ENTRY_NODE]}/status" &>/dev/null; do sleep 1; done
 
-get_share_info() {
-  local status_json="$1"
-  local total
-  total=$(echo "$status_json" | jq -r '.total_shares // 10')
-  local count
-  count=$(echo "$status_json" | jq -r '.share_count // 0')
-  echo "$count $total"
-}
-
-# ── Banner ───────────────────────────────────────────────────────
-print_banner() {
-  echo ""
-  echo -e "${BOLD}================================================${RESET}"
-  echo -e "${BOLD}${CYAN} Gossip Cluster — Secret Injection${RESET}"
-  echo -e "${BOLD} Topology:  aag${RESET}"
-  echo -e "${BOLD} CID:       ${CID}${RESET}"
-  echo -e "${BOLD} Secret ID: ${SECRET_ID}${RESET}"
-  echo -e "${BOLD}================================================${RESET}"
-  echo ""
-}
-
-# ── Main ─────────────────────────────────────────────────────────
-check_deps
-print_banner
-wait_for_cluster
-
-# Cluster members
-echo -e "${BOLD}── Cluster members ──${RESET}"
-members_json=$(curl -sf "http://${NODE_PORTS[node01]}/members" 2>/dev/null || echo '{}')
-echo "$members_json" | jq -c .
-echo ""
-
-# Inject secret into node01
-echo -e "${BOLD}── Injecting secret into node01 ──${RESET}"
-inject_resp=$(curl -sf -X POST \
-  -H "Content-Type: application/json" \
+echo -e "${BOLD}── Injecting real CID into ${ENTRY_NODE} ──${RESET}"
+curl -sf -X POST -H "Content-Type: application/json" \
   -d "{\"secret_id\":\"${SECRET_ID}\",\"cid\":\"${CID}\"}" \
-  "http://${NODE_PORTS[node01]}/inject" 2>/dev/null || echo '{"error":"inject failed"}')
-echo "$inject_resp" | jq -c .
-echo ""
+  "http://${NODE_PORTS[$ENTRY_NODE]}/inject" > /dev/null
 
-# ── Propagation (Event-Driven Replay) ────────────────────────────
-echo -e "${BOLD}── Propagation (hop-event driven) ──${RESET}"
-
-total_nodes=${#NODES[@]}
+echo -e "\n${BOLD}── Propagation (hop-event driven) ──${RESET}"
 start_ts=$(date +%s)
+prev_done=-1; same_count=0
 
-# 1. Wait until gossip has settled in real-time
-echo -e "${DIM}Waiting for gossip to settle...${RESET}"
-prev_done=-1
-same_count=0
 while true; do
   elapsed=$(( $(date +%s) - start_ts ))
   [[ $elapsed -ge $POLL_DURATION ]] && break
-
   done_count=0
   for node in "${NODES[@]}"; do
     s=$(get_status "$node")
@@ -137,13 +91,7 @@ while true; do
     [[ "$c" == "$t" && "$c" -gt 0 ]] && done_count=$((done_count + 1))
   done
 
-  # Break if everyone has it
-  if [[ $done_count -eq $total_nodes ]]; then
-    sleep 0.2 # Brief buffer for final logs to flush
-    break
-  fi
-
-  # Break if network stalled (no new nodes got it for 1 second)
+  if [[ $done_count -eq $total_nodes ]]; then sleep 0.2; break; fi
   if [[ $done_count -eq $prev_done && $done_count -gt 0 ]]; then
     same_count=$((same_count + 1))
     [[ $same_count -ge 5 ]] && break
@@ -151,88 +99,60 @@ while true; do
     same_count=0
   fi
   prev_done=$done_count
-
   sleep 0.2
 done
-# Erase the "waiting" line
 printf "\033[1A\033[2K" 
 
-# 2. Fetch final status snapshot once for all nodes
 declare -A final_status
-for node in "${NODES[@]}"; do
-  final_status[$node]=$(get_status "$node")
-done
-
-# Find the max hop number across all nodes
 max_hop=0
 for node in "${NODES[@]}"; do
-  node_max=$(echo "${final_status[$node]}" | jq '[.hop_log[].hop] | max // -1')
+  final_status[$node]=$(get_status "$node")
+  node_max=$(echo "${final_status[$node]}" | jq '[.hop_log[]?.hop] | max // -1')
   [[ $node_max -gt $max_hop ]] && max_hop=$node_max
 done
 
-# Cumulative state tracking
-declare -A reconstructed
-for node in "${NODES[@]}"; do
-  reconstructed[$node]=0
-done
-
-# 3. Iterate hop by hop, building the chronological view
 for (( hop=0; hop<=max_hop; hop++ )); do
-
-  # For each node, check if it has a hop_log entry at this exact hop
+  paths_str=""; recon_count=0; row=""
   for node in "${NODES[@]}"; do
-    has_event=$(echo "${final_status[$node]}" \
-      | jq --argjson h "$hop" '[.hop_log[].hop] | map(select(. == $h)) | length')
-    [[ "$has_event" -gt 0 ]] && reconstructed[$node]=1
-  done
-
-  # Count cumulative reconstructed nodes
-  recon_count=0
-  for node in "${NODES[@]}"; do
-    [[ "${reconstructed[$node]}" -eq 1 ]] && recon_count=$((recon_count + 1))
-  done
-
-  # Build the row using cumulative state (not live status)
-  row=""
-  for node in "${NODES[@]}"; do
-    short="${node/node/n}"
-    if [[ "${reconstructed[$node]}" -eq 1 ]]; then
-      row+="$(printf '\033[32m%s:[10/10 \xe2\x9c\x93]\033[0m ' "$short")"
+    short_to="${node/node/n}"
+    node_paths=$(echo "${final_status[$node]}" | jq -r --argjson h "$hop" '.hop_log[]? | select(.hop == $h and .from_node != "init" and .from_node != "init_rev") | "\(.from_node)|\(.fragment_id)"' 2>/dev/null || true)
+    for p in $node_paths; do
+       IFS='|' read -r from_node frag_id <<< "$p"
+       paths_str+="${from_node/node/n}-[f${frag_id}]->${short_to}  "
+    done
+    fc=$(echo "${final_status[$node]}" | jq --argjson h "$hop" '[.hop_log[]? | select(.hop <= $h and .fragment_id != -1) | .fragment_id] | unique | length')
+    if [[ "$fc" -eq 2 ]]; then
+      row+="$(printf '\033[32m%s:[2/2 \xe2\x9c\x93]\033[0m ' "$short_to")"
+      recon_count=$((recon_count + 1))
+    elif [[ "$fc" -eq 1 ]]; then
+      row+="$(printf '\033[33m%s:[1/2  ]\033[0m ' "$short_to")"
     else
-      row+="$(printf '\033[2m%s:[0/10  ]\033[0m ' "$short")"
+      row+="$(printf '\033[2m%s:[0/2  ]\033[0m ' "$short_to")"
     fi
   done
-
-  printf "Hop %-2d   ${row}  (%d/%d reconstructed)\n" \
-    "$hop" "$recon_count" "$total_nodes"
+  printf "Hop %-2d   ${row}  (%d/%d reconstructed)\n" "$hop" "$recon_count" "$total_nodes"
+  [[ -n "$paths_str" ]] && echo -e "         ↳ ${CYAN}Paths: ${paths_str}${RESET}"
 done
 
-unset final_status reconstructed
-
-if [[ $done_count -eq $total_nodes ]]; then
-  echo ""
-  echo -e "${GREEN}${BOLD}All nodes have received the secret!${RESET}"
-else
-  echo ""
-  echo -e "${YELLOW}Gossip settled, but only ${done_count}/${total_nodes} nodes received the secret.${RESET}"
-fi
-
-# Final state summary
-echo ""
-echo -e "${BOLD}── Final state (all nodes) ──${RESET}"
+echo -e "\n${BOLD}── Final state (all nodes) ──${RESET}"
 for node in "${NODES[@]}"; do
-  status_json=$(get_status "$node")
+  status_json="${final_status[$node]}"
   shares_count=$(echo "$status_json" | jq -r '.share_count // 0')
-  total_s=$(echo "$status_json" | jq -r '.total_shares // 10')
-  cid=$(echo "$status_json" | jq -r --arg sid "$SECRET_ID" \
-    '.reconstructed[$sid].cid // ""')
-  tomb=$(echo "$status_json" | jq -r \
-    'if (.tombstones | length) > 0 then "True" else "False" end')
-
-  printf "  %-8s  shares=[%s/%s]  cid=%-16s  tomb=%s\n" \
-    "$node" "$shares_count" "$total_s" "${cid:-N/A}" "$tomb"
+  node_cid=$(echo "$status_json" | jq -r --arg sid "$SECRET_ID" '.reconstructed[$sid].cid // ""')
+  tomb=$(echo "$status_json" | jq -r 'if (.tombstones | length) > 0 then "True" else "False" end')
+  
+  # Highlight the real CID in green when successfully reconstructed
+  if [[ "$node_cid" == "$CID" ]]; then
+      printf "  %-8s  shares=[%s/2]  cid=${GREEN}%-46s${RESET}  tomb=%s\n" "$node" "$shares_count" "$node_cid" "$tomb"
+  else
+      printf "  %-8s  shares=[%s/2]  cid=%-46s  tomb=%s\n" "$node" "$shares_count" "${node_cid:-N/A}" "$tomb"
+  fi
 done
+echo ""
 
-echo ""
-echo -e "${DIM}Simulation complete. Run 'docker compose logs' for node-level detail.${RESET}"
-echo ""
+# Give the final IPFS download link if the target node got it
+if [[ "$(echo "${final_status[$TARGET_NODE]}" | jq -r '.share_count')" == "2" ]]; then
+    echo -e "${GREEN}🎯 Target ($TARGET_NODE) successfully reconstructed the IPFS CID!${RESET}"
+    echo -e "You can view/download the original file via the local IPFS gateway:"
+    echo -e "${CYAN}http://localhost:8099/ipfs/${CID}${RESET}\n"
+fi

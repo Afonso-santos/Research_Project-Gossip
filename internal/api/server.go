@@ -18,6 +18,7 @@ type Server struct {
 func New(node *gossip.Node) *Server {
 	s := &Server{node: node, mux: http.NewServeMux()}
 	s.mux.HandleFunc("/inject", s.handleInject)
+	s.mux.HandleFunc("/revoke", s.handleRevoke) // <-- NEW: Added Revocation endpoint
 	s.mux.HandleFunc("/gossip", s.handleGossip)
 	s.mux.HandleFunc("/status", s.handleStatus)
 	s.mux.HandleFunc("/members", s.handleMembers)
@@ -68,6 +69,36 @@ func (s *Server) handleInject(w http.ResponseWriter, r *http.Request) {
 		"shares":    s.node.TotalShares,
 		"threshold": 3,
 		"topology":  s.node.TopologyStr,
+	})
+}
+
+// NEW: handleRevoke starts the anti-rumor death certificate.
+// POST /revoke body: {"secret_id":"..."}
+func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
+	secretID := gossip.HardcodedSecretID
+
+	if r.Method == http.MethodPost {
+		var req struct {
+			SecretID string `json:"secret_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+			if req.SecretID != "" {
+				secretID = req.SecretID
+			}
+		}
+	} else {
+		if v := r.URL.Query().Get("secret_id"); v != "" {
+			secretID = v
+		}
+	}
+
+	log.Printf("[%s] /revoke triggered for secret=%s", s.node.ID, secretID)
+	s.node.Revoke(secretID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"secret_id": secretID,
+		"status":    "revoked",
 	})
 }
 

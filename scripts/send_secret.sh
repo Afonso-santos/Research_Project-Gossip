@@ -60,7 +60,7 @@ DIM="\033[2m"
 RESET="\033[0m"
 
 get_status() { curl -sf --max-time 2 "http://${NODE_PORTS[$1]}/status" 2>/dev/null || echo '{}'; }
-get_share_info() { echo "$(echo "$1" | jq -r '.share_count // 0') 2"; }
+get_share_info() { echo "$(echo "$1" | jq -r '.share_count // 0') $(echo "$1" | jq -r '.total_shares // 2')"; }
 
 echo -e "\n${BOLD}================================================${RESET}"
 echo -e "${BOLD}${CYAN} Gossip Cluster — IPFS Secret Injection${RESET}"
@@ -120,14 +120,21 @@ for (( hop=0; hop<=max_hop; hop++ )); do
        IFS='|' read -r from_node frag_id <<< "$p"
        paths_str+="${from_node/node/n}-[f${frag_id}]->${short_to}  "
     done
-    fc=$(echo "${final_status[$node]}" | jq --argjson h "$hop" '[.hop_log[]? | select(.hop <= $h and .fragment_id != -1) | .fragment_id] | unique | length')
-    if [[ "$fc" -eq 2 ]]; then
-      row+="$(printf '\033[32m%s:[2/2 \xe2\x9c\x93]\033[0m ' "$short_to")"
+    
+    # Extract the dynamic threshold for this specific node
+    thresh=$(echo "${final_status[$node]}" | jq -r '.total_shares // 2')
+    fc=$(echo "${final_status[$node]}" | jq --argjson h "$hop" '[.hop_log[]? | select(.hop <= $h and .fragment_id != -1 and .fragment_id != -99) | .fragment_id] | unique | length')
+    is_revoked=$(echo "${final_status[$node]}" | jq -r --argjson h "$hop" 'any(.hop_log[]?; .hop <= $h and .fragment_id == -99)')
+
+    if [[ "$is_revoked" == "true" ]]; then
+      row+="$(printf '\033[31m%s:[XXX]\033[0m ' "$short_to")"
+    elif [[ "$fc" -ge "$thresh" && "$thresh" -gt 0 ]]; then
+      row+="$(printf '\033[32m%s:[%d/%d \xe2\x9c\x93]\033[0m ' "$short_to" "$fc" "$thresh")"
       recon_count=$((recon_count + 1))
-    elif [[ "$fc" -eq 1 ]]; then
-      row+="$(printf '\033[33m%s:[1/2  ]\033[0m ' "$short_to")"
+    elif [[ "$fc" -gt 0 ]]; then
+      row+="$(printf '\033[33m%s:[%d/%d  ]\033[0m ' "$short_to" "$fc" "$thresh")"
     else
-      row+="$(printf '\033[2m%s:[0/2  ]\033[0m ' "$short_to")"
+      row+="$(printf '\033[2m%s:[0/%d  ]\033[0m ' "$short_to" "$thresh")"
     fi
   done
   printf "Hop %-2d   ${row}  (%d/%d reconstructed)\n" "$hop" "$recon_count" "$total_nodes"
@@ -138,20 +145,25 @@ echo -e "\n${BOLD}── Final state (all nodes) ──${RESET}"
 for node in "${NODES[@]}"; do
   status_json="${final_status[$node]}"
   shares_count=$(echo "$status_json" | jq -r '.share_count // 0')
+  thresh=$(echo "$status_json" | jq -r '.total_shares // 2')
   node_cid=$(echo "$status_json" | jq -r --arg sid "$SECRET_ID" '.reconstructed[$sid].cid // ""')
   tomb=$(echo "$status_json" | jq -r 'if (.tombstones | length) > 0 then "True" else "False" end')
   
   # Highlight the real CID in green when successfully reconstructed
   if [[ "$node_cid" == "$CID" ]]; then
-      printf "  %-8s  shares=[%s/2]  cid=${GREEN}%-46s${RESET}  tomb=%s\n" "$node" "$shares_count" "$node_cid" "$tomb"
+      printf "  %-8s  shares=[%s/%s]  cid=${GREEN}%-46s${RESET}  tomb=%s\n" "$node" "$shares_count" "$thresh" "$node_cid" "$tomb"
   else
-      printf "  %-8s  shares=[%s/2]  cid=%-46s  tomb=%s\n" "$node" "$shares_count" "${node_cid:-N/A}" "$tomb"
+      printf "  %-8s  shares=[%s/%s]  cid=%-46s  tomb=%s\n" "$node" "$shares_count" "$thresh" "${node_cid:-N/A}" "$tomb"
   fi
 done
 echo ""
 
 # Give the final IPFS download link if the target node got it
-if [[ "$(echo "${final_status[$TARGET_NODE]}" | jq -r '.share_count')" == "2" ]]; then
+TARGET_STATUS=$(echo "${final_status[$TARGET_NODE]}")
+TARGET_SHARES=$(echo "$TARGET_STATUS" | jq -r '.share_count // 0')
+TARGET_THRESH=$(echo "$TARGET_STATUS" | jq -r '.total_shares // 2')
+
+if [[ "$TARGET_SHARES" -ge "$TARGET_THRESH" && "$TARGET_THRESH" -gt 0 ]]; then
     echo -e "${GREEN}🎯 Target ($TARGET_NODE) successfully reconstructed the IPFS CID!${RESET}"
     echo -e "You can view/download the original file via the local IPFS gateway:"
     echo -e "${CYAN}http://localhost:8099/ipfs/${CID}${RESET}\n"

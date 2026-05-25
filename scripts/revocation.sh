@@ -50,33 +50,28 @@ POLL_DURATION=10
 BOLD="\033[1m"; CYAN="\033[36m"; GREEN="\033[32m"; YELLOW="\033[33m"; RED="\033[31m"; DIM="\033[2m"; RESET="\033[0m"
 
 # ========================================================
-# 🧮 DYNAMIC DELAY CALCULATION
+# 🧮 PROBABILISTIC DETECTION DELAY
 # ========================================================
-HOPS_TO_TARGET=$(( DIAMETER / 2 + 1 ))        
-HOPS_WITH_DELAY=$(( HOPS_TO_TARGET - 1 )) 
+# Instead of a strict calculation, we simulate a real-world
+# probabilistic "Detection Window".
 
+HOPS_TO_TARGET=$(( DIAMETER / 2 + 1 ))
 SECRET_HOP_MS=200       
-REVOCATION_HOP_MS=10    
+SECRET_ETA=$(( HOPS_TO_TARGET * SECRET_HOP_MS ))
 
-SECRET_ARRIVAL_TIME=$(( HOPS_WITH_DELAY * SECRET_HOP_MS ))
-REVOCATION_ARRIVAL_TIME=$(( HOPS_WITH_DELAY * REVOCATION_HOP_MS ))
-MAX_DELAY=$(( SECRET_ARRIVAL_TIME - REVOCATION_ARRIVAL_TIME ))
+MIN_DELAY=$(( SECRET_ETA + 100 )) # Wait at least 100ms AFTER it arrives
+MAX_DELAY=$(( SECRET_ETA + 500 ))
 
-CURL_OVERHEAD=40 
-TIPPING_POINT=$(( MAX_DELAY - CURL_OVERHEAD ))
-SECRET_WIN_MARGIN=0 
-DELAY_MS=$(( TIPPING_POINT + SECRET_WIN_MARGIN ))
-
-[[ $DELAY_MS -lt 0 ]] && DELAY_MS=0
+# Generate a random delay to simulate probabilistically detecting a breach
+DELAY_MS=$(( RANDOM % (MAX_DELAY - MIN_DELAY + 1) + MIN_DELAY ))
 DELAY_SEC=$(awk "BEGIN {print $DELAY_MS/1000}")
 
 echo -e "\n${BOLD}================================================${RESET}"
-echo -e "${BOLD}${CYAN} Gossip Cluster — IPFS Rumor vs Anti-Rumor Race${RESET}"
+echo -e "${BOLD}${CYAN} Gossip Cluster — Probabilistic Anti-Rumor Race${RESET}"
 echo -e "${DIM} File Name:         ${SECRET_ID}${RESET}"
 echo -e "${DIM} Real CID:          ${CID}${RESET}"
-echo -e "${DIM} -> Secret ETA:       ${SECRET_ARRIVAL_TIME}ms ($HOPS_TO_TARGET hops @ ${SECRET_HOP_MS}ms)${RESET}"
-echo -e "${DIM} -> Revocation ETA:   ${REVOCATION_ARRIVAL_TIME}ms ($HOPS_TO_TARGET hops @ ${REVOCATION_HOP_MS}ms)${RESET}"
-echo -e "${BOLD} COMPUTED DELAY:      ${DELAY_MS}ms${RESET}"
+echo -e "${DIM} -> Est. Secret ETA:  ${SECRET_ETA}ms${RESET}"
+echo -e "${BOLD} DETECTION DELAY:   ${DELAY_MS}ms (Simulated Probabilistic Reaction)${RESET}"
 echo -e "${BOLD}================================================${RESET}"
 
 # Wait for cluster
@@ -88,12 +83,12 @@ curl -s -X POST -H "Content-Type: application/json" \
   -d "{\"secret_id\":\"${SECRET_ID}\",\"cid\":\"${CID}\"}" \
   "http://${NODE_PORTS[$ENTRY_NODE]}/inject" > /dev/null
 
-# 2. Wait dynamically computed time
+# 2. Wait dynamically computed probabilistic time
 echo -e "${DIM}⏳ Waiting ${DELAY_MS}ms...${RESET}"
 sleep "$DELAY_SEC"
 
 # 3. Inject the Revocation
-echo -e "${RED}🚨 Injecting Revocation (Anti-Rumor) into ${ENTRY_NODE}!${RESET}\n"
+echo -e "${RED}🚨 Breach Detected! Injecting Revocation (Anti-Rumor) into ${ENTRY_NODE}!${RESET}\n"
 curl -s -X POST -H "Content-Type: application/json" \
   -d "{\"secret_id\":\"${SECRET_ID}\"}" \
   "http://${NODE_PORTS[$ENTRY_NODE]}/revoke" > /dev/null
@@ -151,18 +146,20 @@ for (( hop=0; hop<=max_hop; hop++ )); do
        fi
     done
 
+    # Extract the dynamic threshold for this specific node
+    thresh=$(echo "${final_status[$node]}" | jq -r '.total_shares // 2')
     fc=$(echo "${final_status[$node]}" | jq --argjson h "$hop" '[.hop_log[]? | select(.hop <= $h and .fragment_id != -1 and .fragment_id != -99) | .fragment_id] | unique | length')
     is_revoked=$(echo "${final_status[$node]}" | jq -r --argjson h "$hop" 'any(.hop_log[]?; .hop <= $h and .fragment_id == -99)')
 
     if [[ "$is_revoked" == "true" ]]; then
       row+="$(printf '\033[31m%s:[XXX]\033[0m ' "$short_to")"
-    elif [[ "$fc" -eq 2 ]]; then
-      row+="$(printf '\033[32m%s:[2/2 \xe2\x9c\x93]\033[0m ' "$short_to")"
+    elif [[ "$fc" -ge "$thresh" && "$thresh" -gt 0 ]]; then
+      row+="$(printf '\033[32m%s:[%d/%d \xe2\x9c\x93]\033[0m ' "$short_to" "$fc" "$thresh")"
       recon_count=$((recon_count + 1))
-    elif [[ "$fc" -eq 1 ]]; then
-      row+="$(printf '\033[33m%s:[1/2  ]\033[0m ' "$short_to")"
+    elif [[ "$fc" -gt 0 ]]; then
+      row+="$(printf '\033[33m%s:[%d/%d  ]\033[0m ' "$short_to" "$fc" "$thresh")"
     else
-      row+="$(printf '\033[2m%s:[0/2  ]\033[0m ' "$short_to")"
+      row+="$(printf '\033[2m%s:[0/%d  ]\033[0m ' "$short_to" "$thresh")"
     fi
   done
   printf "Hop %-2d   ${row}  (%d/%d reconstructed)\n" "$hop" "$recon_count" "$total_nodes"
@@ -173,27 +170,32 @@ echo -e "\n${BOLD}── Final state (all nodes) ──${RESET}"
 for node in "${NODES[@]}"; do
   status_json="${final_status[$node]}"
   shares_count=$(echo "$status_json" | jq -r '.share_count // 0')
+  thresh=$(echo "$status_json" | jq -r '.total_shares // 2')
   node_cid=$(echo "$status_json" | jq -r --arg sid "$SECRET_ID" '.reconstructed[$sid].cid // ""')
   tomb=$(echo "$status_json" | jq -r 'if (.tombstones | length) > 0 then "True" else "False" end')
   
   if [[ "$node_cid" == "$CID" ]]; then
-      printf "  %-8s  shares=[%s/2]  cid=${GREEN}%-46s${RESET}  tomb=%s\n" "$node" "$shares_count" "$node_cid" "$tomb"
+      printf "  %-8s  shares=[%s/%s]  cid=${GREEN}%-46s${RESET}  tomb=%s\n" "$node" "$shares_count" "$thresh" "$node_cid" "$tomb"
   else
-      printf "  %-8s  shares=[%s/2]  cid=%-46s  tomb=%s\n" "$node" "$shares_count" "${node_cid:-N/A}" "$tomb"
+      printf "  %-8s  shares=[%s/%s]  cid=%-46s  tomb=%s\n" "$node" "$shares_count" "$thresh" "${node_cid:-N/A}" "$tomb"
   fi
 done
 
+# ========================================================
+# 🏅 FINAL EVALUATION FIX
+# ========================================================
 TARGET_STATUS=$(echo "${final_status[$TARGET_NODE]}")
-TARGET_SHARES=$(echo "$TARGET_STATUS" | jq -r '.share_count')
-IS_TARGET_REVOKED=$(echo "$TARGET_STATUS" | jq -r 'any(.hop_log[]?; .fragment_id == -99)')
+TARGET_SHARES=$(echo "$TARGET_STATUS" | jq -r '.share_count // 0')
+TARGET_THRESH=$(echo "$TARGET_STATUS" | jq -r '.total_shares // 2')
+TARGET_TOMB=$(echo "$TARGET_STATUS" | jq -r 'if (.tombstones | length) > 0 then "True" else "False" end')
 
 echo -e "\n================================================"
-if [[ "$IS_TARGET_REVOKED" == "true" ]]; then
-    echo -e "${GREEN}✅ SUCCESS: The Anti-Rumor successfully intercepted and purged Target ($TARGET_NODE)!${RESET}"
-elif [[ "$TARGET_SHARES" == "2" ]]; then
+if [[ "$TARGET_SHARES" -ge "$TARGET_THRESH" && "$TARGET_THRESH" -gt 0 ]]; then
     echo -e "${RED}❌ FAILED: The Secret reached Target ($TARGET_NODE) before the Anti-Rumor caught it!${RESET}"
     echo -e "You can view/download the original file via the local IPFS gateway:"
     echo -e "${CYAN}http://localhost:8099/ipfs/${CID}${RESET}"
+elif [[ "$TARGET_TOMB" == "True" ]]; then
+    echo -e "${GREEN}✅ SUCCESS: The Anti-Rumor successfully intercepted and purged Target ($TARGET_NODE)!${RESET}"
 else
     echo -e "${YELLOW}⚠️ TIE: The secret didn't reach the target, but neither did the Anti-Rumor.${RESET}"
 fi

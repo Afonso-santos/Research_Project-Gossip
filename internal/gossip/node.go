@@ -2,7 +2,8 @@ package gossip
 
 import (
 	"bytes"
-	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"gossip-sim/internal/config"
+	"github.com/corvus-ch/shamir"
 )
 
 const (
@@ -32,22 +34,27 @@ type HopEvent struct {
 }
 
 type Message struct {
-	CID          string `json:"cid"`
-	SecretID     string `json:"secret_id"`
-	Target       string `json:"target"`
-	Sender       string `json:"sender"`
-	HopCount     int    `json:"hop_count"`
-	Timestamp    int64  `json:"timestamp"`
-	FragmentID   int    `json:"fragment_id"`
-	Data         []byte `json:"data"`
-	IsRevocation bool   `json:"is_revocation"` // <-- NEW: Flags this as an Anti-Rumor
+	CID              string `json:"cid"`
+	SecretID         string `json:"secret_id"`
+	Target           string `json:"target"`
+	Sender           string `json:"sender"`
+	HopCount         int    `json:"hop_count"`
+	Timestamp        int64  `json:"timestamp"`
+	FragmentID       int    `json:"fragment_id"`
+	Threshold        int    `json:"threshold"`
+	Data             []byte `json:"data"`
+	IsRevocation     bool   `json:"is_revocation"`
+	GlobalCommitment string `json:"global_commitment"` // <-- NEW: VSS Global Proof
+	ShareCommitment  string `json:"share_commitment"`  // <-- NEW: VSS Share Proof
 }
 
 type ShareRecord struct {
-	SecretID  string         `json:"secret_id"`
-	CID       string         `json:"cid"`
-	Received  int64          `json:"received_at"`
-	Fragments map[int][]byte `json:"-"`
+	SecretID         string         `json:"secret_id"`
+	CID              string         `json:"cid"`
+	Received         int64          `json:"received_at"`
+	Fragments        map[int][]byte `json:"-"`
+	Threshold        int            `json:"threshold"`
+	GlobalCommitment string         `json:"global_commitment"` // <-- NEW: Store proof for reconstruction
 }
 
 type Status struct {
@@ -105,76 +112,86 @@ func NewNode(id string, topo *config.Topology, peerPorts map[string]string, tota
 	return n
 }
 
-// Inject starts gossip from this node.
+// Inject starts gossip from this node using Dynamic Shamir's Secret Sharing with VSS.
 func (n *Node) Inject(secretID, cid string) {
 	n.mu.Lock()
 
-	frag0 := make([]byte, len(cid))
-	rand.Read(frag0)
+	// 1. Dynamically calculate N (total shares) and K (threshold)
+	n_shares := len(n.Neighbors)
+	if n_shares < 2 {
+		n_shares = 2 // Enforce a minimum requirement
+	}
+	k_threshold := (n_shares / 2) + 1 // Dynamic majority threshold
 
-	frag1 := make([]byte, len(cid))
-	for i := 0; i < len(cid); i++ {
-		frag1[i] = cid[i] ^ frag0[i]
+	// 2. Generate mathematically secure Shamir shares
+	sharesMap, err := shamir.Split([]byte(cid), n_shares, k_threshold)
+	if err != nil {
+		log.Printf("[%s] Error splitting secret: %v", n.ID, err)
+		n.mu.Unlock()
+		return
 	}
 
-	n.Reconstructed[secretID] = ShareRecord{
-		SecretID: secretID,
-		CID:      cid,
-		Received: time.Now().UnixMilli(),
-		Fragments: map[int][]byte{
-			0: frag0,
-			1: frag1,
-		},
+	// ====================================================================
+	// VSS UPGRADE: Generate Global Commitment (Proof of the whole CID)
+	// ====================================================================
+	globalHash := sha256.Sum256([]byte(cid))
+	globalCommitment := hex.EncodeToString(globalHash[:])
+
+	record := ShareRecord{
+		SecretID:         secretID,
+		CID:              cid,
+		Received:         time.Now().UnixMilli(),
+		Fragments:        make(map[int][]byte),
+		Threshold:        k_threshold,
+		GlobalCommitment: globalCommitment,
 	}
 
-	n.HopLog = append(n.HopLog, HopEvent{
-		Hop:        0,
-		FromNode:   "init",
-		SecretID:   secretID,
-		FragmentID: 0,
-		Timestamp:  time.Now().UnixMilli(),
-	})
-	n.HopLog = append(n.HopLog, HopEvent{
-		Hop:        0,
-		FromNode:   "init",
-		SecretID:   secretID,
-		FragmentID: 1,
-		Timestamp:  time.Now().UnixMilli(),
-	})
+	var fragmentIDs []int
+	for fragID, data := range sharesMap {
+		fID := int(fragID)
+		record.Fragments[fID] = data
+		fragmentIDs = append(fragmentIDs, fID)
+
+		n.HopLog = append(n.HopLog, HopEvent{
+			Hop:        0,
+			FromNode:   "init",
+			SecretID:   secretID,
+			FragmentID: fID,
+			Timestamp:  time.Now().UnixMilli(),
+		})
+	}
+	n.Reconstructed[secretID] = record
 	n.mu.Unlock()
 
-	half := len(n.Neighbors) / 2
-	if half == 0 {
-		half = 1
-	}
+	// 4. Distribute 1 unique, VERIFIABLE share to each neighbor
+	for idx, neighbor := range n.Neighbors {
+		if idx >= len(fragmentIDs) {
+			break
+		}
+		fID := fragmentIDs[idx]
+		shareData := sharesMap[byte(fID)]
 
-	group0 := n.Neighbors[:half]
-	group1 := n.Neighbors[half:]
+		// VSS UPGRADE: Generate Share Commitment (Proof of this specific fragment)
+		shareHash := sha256.Sum256(shareData)
+		shareCommitment := hex.EncodeToString(shareHash[:])
 
-	msg0 := Message{
-		SecretID:   secretID,
-		Target:     n.Target,
-		Sender:     n.ID,
-		HopCount:   1,
-		Timestamp:  time.Now().UnixMilli(),
-		FragmentID: 0,
-		Data:       frag0,
+		msg := Message{
+			SecretID:         secretID,
+			Target:           n.Target,
+			Sender:           n.ID,
+			HopCount:         1,
+			Timestamp:        time.Now().UnixMilli(),
+			FragmentID:       fID,
+			Threshold:        k_threshold,
+			Data:             shareData,
+			GlobalCommitment: globalCommitment,
+			ShareCommitment:  shareCommitment,
+		}
+		n.gossipOutTo(msg, []string{neighbor})
 	}
-	n.gossipOutTo(msg0, group0)
-
-	msg1 := Message{
-		SecretID:   secretID,
-		Target:     n.Target,
-		Sender:     n.ID,
-		HopCount:   1,
-		Timestamp:  time.Now().UnixMilli(),
-		FragmentID: 1,
-		Data:       frag1,
-	}
-	n.gossipOutTo(msg1, group1)
 }
 
-// NEW: Revoke acts as an Anti-Rumor to hunt down and kill a secret
+// Revoke acts as an Anti-Rumor to hunt down and kill a secret
 func (n *Node) Revoke(secretID string) {
 	n.mu.Lock()
 	
@@ -228,6 +245,7 @@ func (n *Node) processLoop() {
 		n.handleMessage(msg)
 	}
 }
+
 func (n *Node) handleMessage(msg Message) {
 	n.mu.Lock()
 
@@ -235,7 +253,6 @@ func (n *Node) handleMessage(msg Message) {
 	// REVOCATION INTERCEPTOR (Anti-Rumor handling)
 	// ====================================================================
 	if msg.IsRevocation {
-		// If already tombstoned, ignore to prevent infinite anti-rumor loops
 		if n.Tombstones[msg.SecretID] {
 			n.mu.Unlock()
 			return
@@ -247,7 +264,6 @@ func (n *Node) handleMessage(msg Message) {
 		n.SharesBuffered[msg.SecretID] = 0
 		n.Tombstones[msg.SecretID] = true
 
-		// LOG THE ANTI-RUMOR HOP SO THE SCRIPT CAN SEE IT!
 		n.HopLog = append(n.HopLog, HopEvent{
 			Hop:        msg.HopCount,
 			FromNode:   msg.Sender,
@@ -257,17 +273,25 @@ func (n *Node) handleMessage(msg Message) {
 		})
 		n.mu.Unlock()
 
-		// Forward the Anti-Rumor aggressively to all neighbors
 		fwdMsg := msg
 		fwdMsg.Sender = n.ID
 		fwdMsg.HopCount = msg.HopCount + 1
 		
-		// Fast lane for Anti-Rumors (10ms instead of 200ms)
 		go func() {
 			time.Sleep(10 * time.Millisecond) 
 			n.gossipOutTo(fwdMsg, n.Neighbors)
 		}()
 		return
+	}
+
+	// ====================================================================
+	// VSS UPGRADE: Share-Level Verification
+	// ====================================================================
+	expectedHash := sha256.Sum256(msg.Data)
+	if hex.EncodeToString(expectedHash[:]) != msg.ShareCommitment {
+		log.Printf("[%s] ❌ VSS DROP: Share %d from %s failed cryptographic verification!", n.ID, msg.FragmentID, msg.Sender)
+		n.mu.Unlock()
+		return // Silently drop the malicious/corrupted packet!
 	}
 
 	// Standard Fragment processing continues here...
@@ -279,9 +303,11 @@ func (n *Node) handleMessage(msg Message) {
 	record, exists := n.Reconstructed[msg.SecretID]
 	if !exists {
 		record = ShareRecord{
-			SecretID:  msg.SecretID,
-			Received:  time.Now().UnixMilli(),
-			Fragments: make(map[int][]byte),
+			SecretID:         msg.SecretID,
+			Received:         time.Now().UnixMilli(),
+			Fragments:        make(map[int][]byte),
+			Threshold:        msg.Threshold,
+			GlobalCommitment: msg.GlobalCommitment, // Save the global proof!
 		}
 	} else if record.Fragments == nil {
 		record.Fragments = make(map[int][]byte)
@@ -295,18 +321,30 @@ func (n *Node) handleMessage(msg Message) {
 	record.Fragments[msg.FragmentID] = msg.Data
 	isTarget := n.ID == msg.Target
 
-	if len(record.Fragments) == 2 && record.CID == "" {
-		f0 := record.Fragments[0]
-		f1 := record.Fragments[1]
-		recovered := make([]byte, len(f0))
-		for i := 0; i < len(f0); i++ {
-			recovered[i] = f0[i] ^ f1[i]
+	// ====================================================================
+	// VSS UPGRADE: Global Reconstruction & Verification
+	// ====================================================================
+	if len(record.Fragments) == msg.Threshold && record.CID == "" {
+		shamirParts := make(map[byte][]byte)
+		for fID, fData := range record.Fragments {
+			shamirParts[byte(fID)] = fData
 		}
-		record.CID = string(recovered)
 
-		if isTarget {
-			n.Tombstones[msg.SecretID] = true
-			log.Printf("[%s] 🎯 TARGET REACHED — Reconstructed CID: %s, tombstoning %s", n.ID, record.CID, msg.SecretID)
+		recovered, err := shamir.Combine(shamirParts)
+		if err == nil {
+			// Verify the Reconstructed CID against the Originator's Global Commitment!
+			recoveredHash := sha256.Sum256(recovered)
+			if hex.EncodeToString(recoveredHash[:]) == record.GlobalCommitment {
+				record.CID = string(recovered)
+				if isTarget {
+					n.Tombstones[msg.SecretID] = true
+					log.Printf("[%s] 🎯 TARGET REACHED & VSS VERIFIED — Reconstructed CID: %s, tombstoning %s", n.ID, record.CID, msg.SecretID)
+				}
+			} else {
+				log.Printf("[%s] ❌ VSS FAILURE: Reconstructed CID does not match the originator's global commitment!", n.ID)
+			}
+		} else {
+			log.Printf("[%s] Error combining Shamir shares: %v", n.ID, err)
 		}
 	}
 
@@ -326,19 +364,23 @@ func (n *Node) handleMessage(msg Message) {
 	}
 
 	fwdMsg := Message{
-		SecretID:   msg.SecretID,
-		Target:     msg.Target,
-		Sender:     n.ID,
-		HopCount:   msg.HopCount + 1,
-		Timestamp:  time.Now().UnixMilli(),
-		FragmentID: msg.FragmentID,
-		Data:       msg.Data,
+		SecretID:         msg.SecretID,
+		Target:           msg.Target,
+		Sender:           n.ID,
+		HopCount:         msg.HopCount + 1,
+		Timestamp:        time.Now().UnixMilli(),
+		FragmentID:       msg.FragmentID,
+		Threshold:        msg.Threshold,
+		Data:             msg.Data,
+		GlobalCommitment: msg.GlobalCommitment, // Forward the VSS global proof
+		ShareCommitment:  msg.ShareCommitment,  // Forward the VSS share proof
 	}
 
 	n.mu.Unlock()
 
 	go n.delayedAAGForward(fwdMsg)
 }
+
 func (n *Node) delayedAAGForward(fwdMsg Message) {
 	time.Sleep(200 * time.Millisecond)
 
@@ -364,22 +406,19 @@ func (n *Node) delayedAAGForward(fwdMsg Message) {
 	// ====================================================================
 	// CONFIDENTIALITY UPGRADE: Disjoint Path Filter
 	// ====================================================================
-	if len(children) > 1 {
+	if len(children) > 1 && fwdMsg.Threshold > 0 {
 		sort.Strings(children) // Ensure deterministic order across all nodes
 		var disjointChildren []string
 		for i, child := range children {
-			// VIP PASS 1: NEVER filter out the final destination!
 			if child == fwdMsg.Target {
 				disjointChildren = append(disjointChildren, child)
 				continue
 			}
 			
-			// Enforce lanes for all other intermediate nodes
-			if i%2 == fwdMsg.FragmentID%2 {
+			if i % fwdMsg.Threshold == fwdMsg.FragmentID % fwdMsg.Threshold {
 				disjointChildren = append(disjointChildren, child)
 			}
 		}
-		// Only apply the filter if it doesn't completely dead-end the fragment
 		if len(disjointChildren) > 0 {
 			children = disjointChildren
 		}
@@ -391,8 +430,6 @@ func (n *Node) delayedAAGForward(fwdMsg Message) {
 
 	maxProb := 0.0
 	for _, child := range children {
-		// VIP PASS 2: If the destination is our direct neighbor,
-		// guarantee delivery! Do not rely on probability.
 		if child == fwdMsg.Target {
 			maxProb = 1.0
 			break
@@ -418,6 +455,7 @@ func (n *Node) delayedAAGForward(fwdMsg Message) {
 		n.gossipOutTo(fwdMsg, children)
 	}
 }
+
 func (n *Node) aagProbability(parentCount int) float64 {
 	if parentCount <= 1 {
 		return 1.0
@@ -474,8 +512,12 @@ func (n *Node) GetStatus() Status {
 	}
 
 	shareCount := 0
+	dynamicThreshold := 2 // Default fallback
 	for _, rec := range n.Reconstructed {
 		shareCount = len(rec.Fragments)
+		if rec.Threshold > 0 {
+			dynamicThreshold = rec.Threshold // Override with dynamic value
+		}
 		break 
 	}
 
@@ -504,7 +546,7 @@ func (n *Node) GetStatus() Status {
 		Tombstones:     tombList,
 		TwoHop:         twoHop,
 		ShareCount:     shareCount,
-		TotalShares:    2, 
+		TotalShares:    dynamicThreshold, 
 		HopLog:         hopLog,
 	}
 }

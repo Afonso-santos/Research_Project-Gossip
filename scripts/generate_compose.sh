@@ -55,7 +55,7 @@ services:
     container_name: ipfs_node
     ports:
       - "5001:5001" # IPFS API
-      - "8099:8080" # IPFS Gateway
+      - "8199:8080" # IPFS Gateway
     networks:
       - gossip-net
     restart: unless-stopped

@@ -1,0 +1,17 @@
+{
+  "topology": "linear_10",
+  "nodes": {
+    "node01": { "id": "node01", "neighbors": ["node02"] },
+    "node02": { "id": "node02", "neighbors": ["node01", "node03"] },
+    "node03": { "id": "node03", "neighbors": ["node02", "node04"] },
+    "node04": { "id": "node04", "neighbors": ["node03", "node05"] },
+    "node05": { "id": "node05", "neighbors": ["node04", "node06"] },
+    "node06": { "id": "node06", "neighbors": ["node05", "node07"] },
+    "node07": { "id": "node07", "neighbors": ["node06", "node08"] },
+    "node08": { "id": "node08", "neighbors": ["node07", "node09"] },
+    "node09": { "id": "node09", "neighbors": ["node08", "node10"] },
+    "node10": { "id": "node10", "neighbors": ["node09"] }
+  },
+  "target": "node10",
+  "diameter": 9
+}

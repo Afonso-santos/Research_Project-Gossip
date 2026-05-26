@@ -5,7 +5,7 @@ x-peers: &peers
 x-common: &common
   build: .
   volumes:
-    - /home/afonso/Research_Project/Gossip-SIM/topology/topology.json:/etc/gossip/topology.json:ro
+    - /home/afonso/Research_Project/Gossip-SIM/topology/bottleneckSmall.json:/etc/gossip/topology.json:ro
   environment:
     <<: *peers
     TOPOLOGY_FILE: /etc/gossip/topology.json
@@ -21,7 +21,7 @@ services:
     container_name: ipfs_node
     ports:
       - "5001:5001" # IPFS API
-      - "8099:8080" # IPFS Gateway
+      - "8199:8080" # IPFS Gateway
     networks:
       - gossip-net
     restart: unless-stopped

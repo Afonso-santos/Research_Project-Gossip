@@ -1,0 +1,27 @@
+{
+  "topology": "ring_20",
+  "nodes": {
+    "node01": { "id": "node01", "neighbors": ["node02", "node20"] },
+    "node02": { "id": "node02", "neighbors": ["node01", "node03"] },
+    "node03": { "id": "node03", "neighbors": ["node02", "node04"] },
+    "node04": { "id": "node04", "neighbors": ["node03", "node05"] },
+    "node05": { "id": "node05", "neighbors": ["node04", "node06"] },
+    "node06": { "id": "node06", "neighbors": ["node05", "node07"] },
+    "node07": { "id": "node07", "neighbors": ["node06", "node08"] },
+    "node08": { "id": "node08", "neighbors": ["node07", "node09"] },
+    "node09": { "id": "node09", "neighbors": ["node08", "node10"] },
+    "node10": { "id": "node10", "neighbors": ["node09", "node11"] },
+    "node11": { "id": "node11", "neighbors": ["node10", "node12"] },
+    "node12": { "id": "node12", "neighbors": ["node11", "node13"] },
+    "node13": { "id": "node13", "neighbors": ["node12", "node14"] },
+    "node14": { "id": "node14", "neighbors": ["node13", "node15"] },
+    "node15": { "id": "node15", "neighbors": ["node14", "node16"] },
+    "node16": { "id": "node16", "neighbors": ["node15", "node17"] },
+    "node17": { "id": "node17", "neighbors": ["node16", "node18"] },
+    "node18": { "id": "node18", "neighbors": ["node17", "node19"] },
+    "node19": { "id": "node19", "neighbors": ["node18", "node20"] },
+    "node20": { "id": "node20", "neighbors": ["node19", "node01"] }
+  },
+  "target": "node11",
+  "diameter": 10
+}

@@ -1,0 +1,22 @@
+{
+  "topology": "mesh_convergence_15",
+  "nodes": {
+    "node01": { "id": "node01", "neighbors": ["node02", "node03", "node04"] },
+    "node02": { "id": "node02", "neighbors": ["node01", "node03", "node05", "node06"] },
+    "node03": { "id": "node03", "neighbors": ["node01", "node02", "node04", "node05", "node06", "node07"] },
+    "node04": { "id": "node04", "neighbors": ["node01", "node03", "node06", "node07"] },
+    "node05": { "id": "node05", "neighbors": ["node02", "node03", "node08", "node09"] },
+    "node06": { "id": "node06", "neighbors": ["node02", "node03", "node04", "node08", "node09", "node10"] },
+    "node07": { "id": "node07", "neighbors": ["node03", "node04", "node09", "node10"] },
+    "node08": { "id": "node08", "neighbors": ["node05", "node06", "node11", "node12"] },
+    "node09": { "id": "node09", "neighbors": ["node05", "node06", "node07", "node11", "node12", "node13"] },
+    "node10": { "id": "node10", "neighbors": ["node06", "node07", "node12", "node13"] },
+    "node11": { "id": "node11", "neighbors": ["node08", "node09", "node14", "node15"] },
+    "node12": { "id": "node12", "neighbors": ["node08", "node09", "node10", "node14", "node15"] },
+    "node13": { "id": "node13", "neighbors": ["node09", "node10", "node14", "node15"] },
+    "node14": { "id": "node14", "neighbors": ["node11", "node12", "node13", "node15"] },
+    "node15": { "id": "node15", "neighbors": ["node11", "node12", "node13", "node14"] }
+  },
+  "target": "node15",
+  "diameter": 5
+}

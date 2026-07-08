@@ -1,5 +1,5 @@
 # Gossip Cluster — AAG P2P Simulation
-
+## Grade: 8/10 ⭐️
 A decentralised gossip simulation implementing the **Advanced Adaptive Gossiping (AAG)** protocol with 2-hop neighbourhood routing, **dynamic Shamir's Secret Sharing (SSS)**, **hop-by-hop Verifiable Secret Sharing (VSS)**, and a **probabilistic Anti-Rumor revocation mechanism**. Routes a secret CID from an origin node to a configurable target across Docker-based network topologies.
 
 ---
